@@ -487,7 +487,8 @@ class GaussiansRasterFunc(torch.autograd.Function):
         #     breakpoint()
         
 
-        grad_rgb_image_max=grad_rgb_image.abs().max()
+        # clamp: an all-zero image gradient would otherwise give 0/0 and turn every gradient into NaN
+        grad_rgb_image_max=grad_rgb_image.abs().max().clamp_min(1e-20)
         grad_rgb_image=grad_rgb_image/grad_rgb_image_max
         grad_ndc,grad_cov2d_inv,grad_color,grad_opacities,_,grad_o_square=litegs_fused.rasterize_backward(sorted_pointId,tile_start_index,packed_params,tiles,
                                                                                           transmitance,lst_contributor,
