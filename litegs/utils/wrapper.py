@@ -838,10 +838,12 @@ class CullCompactActivateWithSparseGrad(torch.autograd.Function):
                 size=(*grad.shape[:-2],chunk_num,chunk_size)
                 grads.append(CompactedTensor(size,visible_chunkid,grad.reshape(-1,allocate_chunk_num,chunk_size)))
         else:
+            grads=[]
             for compacted_grad in compactd_grads:
                 size=(*compacted_grad.shape[:-2],chunk_num,chunk_size)
                 grad=torch.zeros(size,device=compacted_grad.device,dtype=compacted_grad.dtype)
                 grad[...,visible_chunkid,:]=compacted_grad
+                grads.append(grad)
         return None,None,None,None,None,*grads
 
 def sparse_adam_update(
