@@ -949,7 +949,8 @@ __global__ void activate_backward_kernel(
         rotation_grad[2][chunk_id][index] = recp_norm * (activated_rotation_grad[2][chunk_id][index] - dot * out_y);
         rotation_grad[3][chunk_id][index] = recp_norm * (activated_rotation_grad[3][chunk_id][index] - dot * out_z);
 
-        opacity_grad[0][chunk_id][index] = activated_opacity_grad[0][chunk_id][index] * (1.0f - 1.0f / (1.0f + __expf(opacity[0][source_chunk_id][index])));
+        float sigmoid_opacity = 1.0f / (1.0f + __expf(-opacity[0][source_chunk_id][index]));
+        opacity_grad[0][chunk_id][index] = activated_opacity_grad[0][chunk_id][index] * sigmoid_opacity * (1.0f - sigmoid_opacity);
 
         //sh
         for (int view_id = 0; view_id < view_matrix.size(0); view_id++)
