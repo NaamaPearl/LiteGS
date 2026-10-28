@@ -46,5 +46,6 @@ std::vector<at::Tensor> rasterize_backward(
     int64_t img_w,
     int64_t tilesize_h,
     int64_t tilesize_w,
-    bool enable_statistic
+    bool enable_statistic,
+    bool fp32_grad_sum
 );

@@ -610,7 +610,8 @@ __global__ void raster_backward_kernel(
     PackedGrad* __restrict__ packed_grad,         //[batch,point_num,9]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> out_err_sum,  //[batch,1,point_num]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> out_err_square_sum,  //[batch,1,point_num]
-    int tiles_num_x, int img_h, int img_w,int pointsnum)
+    int tiles_num_x, int img_h, int img_w,int pointsnum,
+    bool fp32_grad_sum)  // sum the colour and opacity gradients in fp32 (LiteGS: fp16)
 {
     constexpr int VECTOR_SIZE = 2;
     constexpr int PIXELS_PER_THREAD = (tile_size_x * tile_size_y) / (32 * VECTOR_SIZE);//half2: 32 pixel per warp->64 pixel per warp
@@ -726,6 +727,12 @@ __global__ void raster_backward_kernel(
                 half2 grad_b = half2(0, 0);
                 half2 err_square = half2(0, 0);
                 half2 grad_a = half2(0, 0);
+                // fp32_grad_sum: the colour and opacity gradients summed in fp32 as well. In fp16 (max 65504) the sum over
+                // a tile of a large, unoccluded Gaussian (transmittance scaled by SCALER) can overflow to inf.
+                float2 grad_r32 = make_float2(0.f, 0.f);
+                float2 grad_g32 = make_float2(0.f, 0.f);
+                float2 grad_b32 = make_float2(0.f, 0.f);
+                float2 grad_a32 = make_float2(0.f, 0.f);
                 float grad_bxcy = 0;
                 float grad_neg_half_c = 0;
                 float grad_basic = 0;
@@ -759,6 +766,15 @@ __global__ void raster_backward_kernel(
                         grad_r += alpha * reg_buffer[i].t * shared_img_grad[0][i][threadIdx.y * blockDim.x + threadIdx.x];
                         grad_g += alpha * reg_buffer[i].t * shared_img_grad[1][i][threadIdx.y * blockDim.x + threadIdx.x];
                         grad_b += alpha * reg_buffer[i].t * shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x];
+                        if (fp32_grad_sum)
+                        {
+                            half2 term_r = alpha * reg_buffer[i].t * shared_img_grad[0][i][threadIdx.y * blockDim.x + threadIdx.x];
+                            half2 term_g = alpha * reg_buffer[i].t * shared_img_grad[1][i][threadIdx.y * blockDim.x + threadIdx.x];
+                            half2 term_b = alpha * reg_buffer[i].t * shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x];
+                            grad_r32.x += float(term_r.x); grad_r32.y += float(term_r.y);
+                            grad_g32.x += float(term_g.x); grad_g32.y += float(term_g.y);
+                            grad_b32.x += float(term_b.x); grad_b32.y += float(term_b.y);
+                        }
 
 
                         half2 d_alpha = half2(0,0);
@@ -774,6 +790,11 @@ __global__ void raster_backward_kernel(
                         }
 
                         grad_a += d_alpha * G;
+                        if (fp32_grad_sum)
+                        {
+                            half2 term_a = d_alpha * G;
+                            grad_a32.x += float(term_a.x); grad_a32.y += float(term_a.y);
+                        }
                         half2 d_G = point_color_x2.a * d_alpha;
                         half2 d_power = G * d_G;//G * point_alpha * d_alpha
                         if (enable_statistic)
@@ -793,18 +814,37 @@ __global__ void raster_backward_kernel(
                 
                 PackedGrad* grad_addr = packed_grad + point_id;
                 //unsigned mask = __ballot_sync(0xffffffff, grad_opacity!=0);
-                if (__any_sync(0xffffffff, grad_a.x!=half(0)|| grad_a.y!=half(0)))
+                bool has_grad = fp32_grad_sum ? (grad_a32.x != 0.f || grad_a32.y != 0.f)
+                                              : (grad_a.x != half(0) || grad_a.y != half(0));
+                if (__any_sync(0xffffffff, has_grad))
                 {
-                    half2 rg{ grad_r.x + grad_r.y ,grad_g.x + grad_g.y };
-                    half2 ba{ grad_b.x + grad_b.y ,grad_a.x + grad_a.y };
-                    warp_reduce_sum<half2, false>(rg);
-                    warp_reduce_sum<half2, false>(ba);
-                    if (threadIdx.x == 0)
+                    if (fp32_grad_sum)
                     {
-                        atomicAdd(&grad_addr->r, float(rg.x));
-                        atomicAdd(&grad_addr->g, float(rg.y));
-                        atomicAdd(&grad_addr->b, float(ba.x));
-                        atomicAdd(&grad_addr->a, float(ba.y));
+                        float2 rg{ grad_r32.x + grad_r32.y ,grad_g32.x + grad_g32.y };
+                        float2 ba{ grad_b32.x + grad_b32.y ,grad_a32.x + grad_a32.y };
+                        warp_reduce_sum<float2, false>(rg);
+                        warp_reduce_sum<float2, false>(ba);
+                        if (threadIdx.x == 0)
+                        {
+                            atomicAdd(&grad_addr->r, rg.x);
+                            atomicAdd(&grad_addr->g, rg.y);
+                            atomicAdd(&grad_addr->b, ba.x);
+                            atomicAdd(&grad_addr->a, ba.y);
+                        }
+                    }
+                    else
+                    {
+                        half2 rg{ grad_r.x + grad_r.y ,grad_g.x + grad_g.y };
+                        half2 ba{ grad_b.x + grad_b.y ,grad_a.x + grad_a.y };
+                        warp_reduce_sum<half2, false>(rg);
+                        warp_reduce_sum<half2, false>(ba);
+                        if (threadIdx.x == 0)
+                        {
+                            atomicAdd(&grad_addr->r, float(rg.x));
+                            atomicAdd(&grad_addr->g, float(rg.y));
+                            atomicAdd(&grad_addr->b, float(ba.x));
+                            atomicAdd(&grad_addr->a, float(ba.y));
+                        }
                     }
                     if (enable_statistic)
                     {
@@ -898,7 +938,7 @@ d_depth_img.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),\
 reinterpret_cast<PackedGrad*>(packed_grad.data_ptr<float>()),\
 err_sum.packed_accessor32<float, 3, torch::RestrictPtrTraits >(),\
 err_square_sum.packed_accessor32<float, 3, torch::RestrictPtrTraits >(),\
-tilesnum_x, img_h, img_w, packed_params.size(1)
+tilesnum_x, img_h, img_w, packed_params.size(1), fp32_grad_sum
 
 #define LAUNCH_RASTER_BACKWARD_KERNEL(TILE_H, TILE_W, STATISTIC, TRANS, DEPTH) \
     raster_backward_kernel<TILE_H, TILE_W, STATISTIC, TRANS, DEPTH> << <Block3d, Thread3d >> > (RASTER_BACKWARD_PARAMS);
@@ -929,7 +969,8 @@ std::vector<at::Tensor> rasterize_backward(
     int64_t img_w,
     int64_t tile_h,
     int64_t tile_w,
-    bool enable_statistic
+    bool enable_statistic,
+    bool fp32_grad_sum
 )
 {
     at::DeviceGuard guard(packed_params.device());

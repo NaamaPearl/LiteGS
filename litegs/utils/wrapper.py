@@ -457,7 +457,8 @@ class GaussiansRasterFunc(torch.autograd.Function):
         tile_h:int,
         tile_w:int,
         enable_transmitance:bool=False,
-        enable_depth:bool=False
+        enable_depth:bool=False,
+        fp32_grad_sum:bool=False  # sum the colour and opacity gradients in fp32 in the backward (LiteGS: fp16)
     ):
    
         img,transmitance,depth,lst_contributor,packed_params,fragment_count,fragment_weight=litegs_fused.rasterize_forward(sorted_pointId,tile_start_index,
@@ -469,6 +470,7 @@ class GaussiansRasterFunc(torch.autograd.Function):
         ctx.save_for_backward(sorted_pointId,tile_start_index,transmitance,lst_contributor,packed_params,tiles,fragment_count,fragment_weight)
         ctx.arg_tile_size=(tile_h,tile_w)
         ctx.img_hw=(img_h,img_w)
+        ctx.fp32_grad_sum=fp32_grad_sum
 
         if enable_depth==False:
             depth=None
@@ -493,7 +495,8 @@ class GaussiansRasterFunc(torch.autograd.Function):
         grad_ndc,grad_cov2d_inv,grad_color,grad_opacities,_,grad_o_square=litegs_fused.rasterize_backward(sorted_pointId,tile_start_index,packed_params,tiles,
                                                                                           transmitance,lst_contributor,
                                                                                           grad_rgb_image,grad_transmitance_image,grad_depth_image,grad_rgb_image_max,
-                                                                                          img_h,img_w,tile_h,tile_w,StatisticsHelperInst.bStart)
+                                                                                          img_h,img_w,tile_h,tile_w,StatisticsHelperInst.bStart,
+                                                                                          ctx.fp32_grad_sum)
         if StatisticsHelperInst.bStart:
             #if err_sum.isinf().any() or err_square_sum.isinf().any():
             #    breakpoint()
@@ -513,6 +516,7 @@ class GaussiansRasterFunc(torch.autograd.Function):
             grad_cov2d_inv,
             grad_color,
             grad_opacities,
+            None,
             None,
             None,
             None,
@@ -719,16 +723,18 @@ class Binning(BaseWrapper):
     def __binning_fused(
         ndc:torch.Tensor,view_depth:torch.Tensor,inv_cov2d:torch.Tensor,opacity:torch.Tensor,
         valid_length:torch.Tensor|None,feedback_binning_allocate_size:torch.Tensor|None,idx_tensor:torch.Tensor|None,
-        img_pixel_shape:tuple[int,int],tile_size:tuple[int,int]
+        img_pixel_shape:tuple[int,int],tile_size:tuple[int,int],near_plane:float=0.2,cull_by_extent:bool=False
     ):
-        
+
         img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size[0]))),int(math.ceil(img_pixel_shape[1]/float(tile_size[1]))))
         tiles_num=img_tile_shape[0]*img_tile_shape[1]
 
+        # near_plane: Gaussians at a view-space depth up to it are not visible. cull_by_extent: keep a Gaussian whose
+        # screen extent overlaps the image (LiteGS: its centre within +-1.3 NDC)
         pixel_left_up,pixel_right_down,allocate_size=litegs_fused.get_allocate_size(
             ndc,view_depth,inv_cov2d,opacity,
             img_pixel_shape[0],img_pixel_shape[1],tile_size[0],tile_size[1],
-            valid_length
+            valid_length,near_plane,cull_by_extent
         )
         b_visible=(allocate_size!=0)
 

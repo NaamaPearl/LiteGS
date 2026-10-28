@@ -294,6 +294,8 @@ __global__ void get_allocate_size_kernel(
     const torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> tensor_opacity,  //viewnum,pointnum
     const int* __restrict__ valid_length,
     int img_h, int img_w, unsigned int tile_num_h, unsigned int tile_num_w,
+    float near_plane,  // Gaussians at a view-space depth up to this are not visible
+    bool cull_by_extent,  // keep a Gaussian whose screen extent overlaps the image (LiteGS: its centre within +-1.3 NDC)
     torch::PackedTensorAccessor32 < int32_t, 3, torch::RestrictPtrTraits> tensor_left_up,//viewnum,2,pointnum
     torch::PackedTensorAccessor32 < int32_t, 3, torch::RestrictPtrTraits> tensor_right_down,//viewnum,2,pointnum
     torch::PackedTensorAccessor32 < int32_t, 2, torch::RestrictPtrTraits> tensor_allocated_size//viewnum,pointnum
@@ -316,7 +318,9 @@ __global__ void get_allocate_size_kernel(
     float2 p{ screen_uv.x * img_w - 0.5f,screen_uv.y * img_h - 0.5f };
     const dim3 grid{ tile_num_w,tile_num_h,0 };
 
-    bool bVisible = !((ndc.x < -1.3f) || (ndc.x > 1.3f) || (ndc.y < -1.3f) || (ndc.y > 1.3f) || (view_space_z[view_id][index] <= 0.2f) || (con_o.w < 1.0f / 255));
+    bool centre_outside = (ndc.x < -1.3f) || (ndc.x > 1.3f) || (ndc.y < -1.3f) || (ndc.y > 1.3f);
+    // With cull_by_extent the tile range below decides: a Gaussian whose extent misses the image gets no tile
+    bool bVisible = !((!cull_by_extent && centre_outside) || (view_space_z[view_id][index] <= near_plane) || (con_o.w < 1.0f / 255));
     bVisible &= ((con_o.x > 0)& (con_o.z > 0)& (disc < 0));
 
     if (bVisible)
@@ -390,7 +394,7 @@ __global__ void get_allocate_size_kernel(
     inv_cov2d.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),                                           \
     opacity.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),                                             \
     p_valid_length,                                                                                              \
-    height, width,tiles_num_h, tiles_num_w,                                                                      \
+    height, width,tiles_num_h, tiles_num_w, (float)near_plane, cull_by_extent,                                   \
     left_up.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),                                           \
     right_down.packed_accessor32<int32_t, 3, torch::RestrictPtrTraits>(),                                        \
     allocated_size.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>());
@@ -398,7 +402,9 @@ __global__ void get_allocate_size_kernel(
 std::vector<at::Tensor> get_allocate_size(
     at::Tensor ndc, at::Tensor view_space_z, at::Tensor inv_cov2d, at::Tensor opacity,
     int64_t height,int64_t width, int64_t tile_size_h, int64_t tile_size_w,
-    std::optional<at::Tensor> valid_length
+    std::optional<at::Tensor> valid_length,
+    double near_plane,
+    bool cull_by_extent
 )
 {
     at::DeviceGuard guard(ndc.device());
