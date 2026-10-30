@@ -124,7 +124,9 @@ __device__ inline uint32_t processTiles(
             max(rect_min.y, (int)(ellipse_max / BLOCK_V + 1))
         );
 
-        tiles_count += max_tile_v - min_tile_v;
+        // At least 0. A slice where the ellipse lies outside the clamped tile rectangle (its centre far off the image)
+        // gives max_tile_v < min_tile_v. The keys loop below writes nothing for it, so the count must not go below 0.
+        tiles_count += max(0, max_tile_v - min_tile_v);
         // Only update keys array if it exists.
         if (gaussian_keys_unsorted != nullptr) {
             // Loop over tiles and add to keys array
